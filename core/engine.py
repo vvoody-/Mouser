@@ -743,13 +743,15 @@ class Engine:
     def _on_device_wake(self) -> None:
         """The device re-linked after power-saving sleep.
 
-        Its volatile firmware state is gone -- the 0x2121 / 0x2150 invert bits
-        included -- but the HID handle never dropped, so nothing here changed
-        and the fast path in ``_apply_wheel_invert_setting`` would short-circuit
-        on its own cached values. Force the write.
+        The device may have lost reporting or saved settings without dropping
+        the HID handle, so no connection edge exists to replay them. The
+        listener re-arms diverts before invoking this callback; reconcile the
+        Engine-owned settings as well and force the wheel write past its
+        cached-value fast path.
         """
-        print("[Engine] Device wake — replaying wheel native-invert")
+        print("[Engine] Device wake — replaying saved device settings")
         self._schedule_wheel_invert_apply(force=True)
+        self._request_saved_settings_replay()
 
     def _apply_wheel_invert_setting(self, *, force: bool = False) -> None:
         settings = self.cfg.get("settings", {})
@@ -1373,11 +1375,18 @@ class Engine:
             self._replay_inflight = True
         if startup_fallback:
             self._emit_status("Using startup fallback to replay saved device settings")
-        threading.Thread(
-            target=self._replay_saved_settings_worker,
-            daemon=True,
-            name="SavedSettingsReplay",
-        ).start()
+        try:
+            threading.Thread(
+                target=self._replay_saved_settings_worker,
+                daemon=True,
+                name="SavedSettingsReplay",
+            ).start()
+        except Exception as exc:
+            # Match the wheel-replay contract: a transient thread creation
+            # failure must not wedge every later reconnect/wake replay.
+            with self._replay_lock:
+                self._replay_inflight = False
+            print(f"[Engine] saved-settings replay worker did not start: {exc}")
 
     def _on_connection_change(self, connected):
         connection_changed = connected != self._last_connection_state

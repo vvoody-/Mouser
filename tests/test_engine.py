@@ -410,6 +410,31 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
             },
         )
 
+    def test_device_wake_replays_wheel_and_all_saved_settings(self):
+        engine = self._make_engine()
+
+        with (
+            patch.object(engine, "_schedule_wheel_invert_apply") as wheel_replay,
+            patch.object(engine, "_request_saved_settings_replay") as settings_replay,
+        ):
+            engine._on_device_wake()
+
+        wheel_replay.assert_called_once_with(force=True)
+        settings_replay.assert_called_once_with()
+
+    def test_saved_settings_replay_can_retry_after_thread_start_failure(self):
+        engine = self._make_engine()
+        with patch("core.engine.threading.Thread") as thread:
+            thread.return_value.start.side_effect = RuntimeError("cannot start")
+            engine._request_saved_settings_replay()
+        self.assertFalse(engine._replay_inflight)
+
+        threads = []
+        with patch("core.engine.threading.Thread", side_effect=self._thread_factory(threads)):
+            engine._request_saved_settings_replay()
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(engine._replay_inflight)
+
     def test_evdev_only_connected_true_does_not_request_replay_worker(self):
         engine = self._make_engine()
         engine.hook.connected_device = SimpleNamespace(name="MX Master 3S", source="evdev")

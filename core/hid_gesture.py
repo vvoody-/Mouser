@@ -1175,6 +1175,7 @@ class HidGestureListener:
         self._wheel_divert_result = None
         self._tx_lock = threading.Lock()    # serialize concurrent HID writes
         self._wireless_status_idx = None    # feature index of 0x1D4B
+        self._wake_reconfigure_pending = False
         self._haptic_idx = None             # feature index of HAPTIC (0x19B0)
         self._force_sensing_idx = None      # feature index of FORCE_SENSING (0x19C0)
         self._pending_haptic = None
@@ -2343,7 +2344,45 @@ class HidGestureListener:
             f"[HidGesture] Device re-linked (0x1D4B status={status:#04x} "
             f"request={request:#04x} reason={reason:#04x})"
         )
+        # _on_report also runs inside _request. Defer firmware writes until
+        # that exchange has completed instead of nesting a second request.
+        self._wake_reconfigure_pending = True
+
+    def _consume_wake_reconfiguration(self):
+        """Re-arm negotiated controls before replaying settings; listener only.
+
+        Keep a wake pending while a HID gesture/extra button is held. Reusing
+        connect-time _divert() here would select a different gesture CID after
+        a timeout; _divert_extras() would also discard failed bindings. Replay
+        the existing choices and escalate a failed acknowledgement to the
+        normal full reconnect instead.
+        """
+        if not self._wake_reconfigure_pending:
+            return False
+        if self._dev is None or self._feat_idx is None:
+            return False
+        if (self._held or getattr(self, "_native_hold", False)
+                or any(info["held"] for info in self._extra_diverts.values())):
+            return False
+        # Clear before writing: a new status event received during these
+        # exchanges must remain pending for another pass.
+        self._wake_reconfigure_pending = False
+        flags = _DIVERT_RAW_XY if self._rawxy_enabled else _DIVERT_BUTTON_ONLY
+        ok = self._set_cid_reporting(self._gesture_cid, flags) is not None
+        acknowledged = set()
+        if ok:
+            for cid in self._extra_diverts:
+                if self._set_cid_reporting(cid, _DIVERT_BUTTON_ONLY) is None:
+                    ok = False
+                    break
+                acknowledged.add(cid)
+        if not ok:
+            print("[HidGesture] Wake divert reconfiguration failed — reconnecting")
+            self.force_reconnect()
+            return True
+        self._extra_divert_acks = acknowledged
         self._notify_wake()
+        return True
 
     def _notify_wake(self) -> None:
         """Invoke the wake callback, isolating listener-loop from its errors."""
@@ -3502,6 +3541,8 @@ class HidGestureListener:
                         self._apply_pending_haptic()
                     if self._pending_force_sensing is not None:
                         self._apply_pending_force_sensing()
+                    if self._consume_wake_reconfiguration():
+                        continue
                     raw = self._rx(1000)
                     if raw:
                         _no_data_count = 0
@@ -3540,6 +3581,7 @@ class HidGestureListener:
             self._consecutive_request_timeouts = 0
             self._haptic_idx = None
             self._wireless_status_idx = None
+            self._wake_reconfigure_pending = False
             self._force_sensing_idx = None
             self._force_sensing_range = None
             self._haptic_capabilities = None

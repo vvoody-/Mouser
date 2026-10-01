@@ -921,7 +921,13 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         listener._feat_idx = 0x0D
         listener._battery_idx = 0x09
         listener._wireless_status_idx = self.WDS_IDX
+        listener._dev = Mock()
+        listener._set_cid_reporting = Mock(return_value=object())
         return listener
+
+    def _deliver_event(self, listener, event):
+        listener._on_report(event)
+        listener._consume_wake_reconfiguration()
 
     def _event(self, status, request, reason=0x00, feat=None, fsw=0x00):
         # [report-id, device-index, feature-index, func<<4|sw, params...]
@@ -933,7 +939,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x01, 0x01, 0x01))
+        self._deliver_event(listener, self._event(0x01, 0x01, 0x01))
 
         self.assertEqual(woke, [True])
 
@@ -942,7 +948,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x00, 0x01))
+        self._deliver_event(listener, self._event(0x00, 0x01))
 
         self.assertEqual(woke, [True])
 
@@ -954,7 +960,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x01, 0x01, reason=0x00))
+        self._deliver_event(listener, self._event(0x01, 0x01, reason=0x00))
 
         self.assertEqual(woke, [True])
 
@@ -963,7 +969,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x00, 0x00))
+        self._deliver_event(listener, self._event(0x00, 0x00))
 
         self.assertEqual(woke, [])
 
@@ -973,7 +979,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x01, 0x01, fsw=hg_mod.MY_SW))
+        self._deliver_event(listener, self._event(0x01, 0x01, fsw=hg_mod.MY_SW))
 
         self.assertEqual(woke, [])
 
@@ -985,7 +991,7 @@ class DeviceWakeNotificationTests(unittest.TestCase):
         woke = []
         listener._on_wake = lambda: woke.append(True)
 
-        listener._on_report(self._event(0x01, 0x01))
+        self._deliver_event(listener, self._event(0x01, 0x01))
 
         self.assertEqual(woke, [])
 
@@ -996,7 +1002,98 @@ class DeviceWakeNotificationTests(unittest.TestCase):
             raise RuntimeError("ui gone")
 
         listener._on_wake = _boom
-        listener._on_report(self._event(0x01, 0x01))   # must not raise
+        self._deliver_event(listener, self._event(0x01, 0x01))   # must not raise
+
+    def test_status_event_does_not_nest_firmware_requests(self):
+        listener = self._listener()
+        listener._on_wake = Mock()
+        listener._on_report(self._event(0x01, 0x01))
+        listener._set_cid_reporting.assert_not_called()
+        listener._on_wake.assert_not_called()
+
+        listener._consume_wake_reconfiguration()
+        listener._set_cid_reporting.assert_called_once()
+        listener._on_wake.assert_called_once_with()
+
+    def test_reconfigure_preserves_negotiated_controls_and_acknowledges_extras(self):
+        listener = self._listener()
+        listener._gesture_cid = 0x01A0
+        listener._rawxy_enabled = True
+        listener._extra_diverts = {0x00C3: {"held": False}, 0x00C4: {"held": False}}
+        listener._on_wake = Mock()
+
+        self._deliver_event(listener, self._event(0x01, 0x01))
+
+        self.assertEqual(listener._gesture_cid, 0x01A0)
+        self.assertEqual(listener._extra_divert_acks, {0x00C3, 0x00C4})
+        self.assertEqual(listener._set_cid_reporting.call_args_list, [
+            unittest.mock.call(0x01A0, hg_mod._DIVERT_RAW_XY),
+            unittest.mock.call(0x00C3, hg_mod._DIVERT_BUTTON_ONLY),
+            unittest.mock.call(0x00C4, hg_mod._DIVERT_BUTTON_ONLY),
+        ])
+        listener._on_wake.assert_called_once_with()
+
+    def test_failed_reconfigure_keeps_bindings_and_requests_reconnect(self):
+        for responses in ([None], [object(), None]):
+            with self.subTest(responses=responses):
+                listener = self._listener()
+                listener._extra_diverts = {0x00C3: {"held": False}}
+                listener._set_cid_reporting.side_effect = responses
+                listener.force_reconnect = Mock()
+                listener._on_wake = Mock()
+
+                self._deliver_event(listener, self._event(0x01, 0x01))
+
+                self.assertIn(0x00C3, listener._extra_diverts)
+                listener.force_reconnect.assert_called_once_with()
+                listener._on_wake.assert_not_called()
+
+    def test_reconfigure_waits_for_primary_or_extra_release(self):
+        for primary_held in (True, False):
+            with self.subTest(primary_held=primary_held):
+                listener = self._listener()
+                listener._held = primary_held
+                listener._extra_diverts = {0x00C3: {"held": not primary_held}}
+                listener._on_report(self._event(0x01, 0x01))
+                self.assertFalse(listener._consume_wake_reconfiguration())
+                listener._set_cid_reporting.assert_not_called()
+                listener._held = False
+                listener._extra_diverts[0x00C3]["held"] = False
+                self.assertTrue(listener._consume_wake_reconfiguration())
+
+    def test_new_wake_during_reconfiguration_is_not_dropped(self):
+        listener = self._listener()
+        def acknowledge(cid, flags):
+            listener._on_report(self._event(0x01, 0x01))
+            return object()
+        listener._set_cid_reporting.side_effect = acknowledge
+        self._deliver_event(listener, self._event(0x01, 0x01))
+        self.assertTrue(listener._wake_reconfigure_pending)
+
+    def test_main_loop_consumes_wake_before_next_read(self):
+        listener = self._listener()
+        listener._running = True
+        listener._on_report(self._event(0x01, 0x01))
+        listener._on_wake = lambda: setattr(listener, "_running", False)
+        with (
+            patch.object(listener, "_try_connect", return_value=True),
+            patch.object(listener, "_rx") as receive,
+            patch.object(listener, "_undivert"),
+        ):
+            listener._main_loop()
+        listener._set_cid_reporting.assert_called_once()
+        receive.assert_not_called()
+
+    def test_native_hold_from_os_fallback_defers_reconfiguration(self):
+        # #323 introduces this state for a press delivered through the OS
+        # fallback while diversion is down. Honour it when present.
+        listener = self._listener()
+        listener._native_hold = True
+        listener._on_report(self._event(0x01, 0x01))
+        self.assertFalse(listener._consume_wake_reconfiguration())
+        listener._set_cid_reporting.assert_not_called()
+        listener._native_hold = False
+        self.assertTrue(listener._consume_wake_reconfiguration())
 
     def test_listener_accepts_on_wake_kwarg(self):
         seen = []
