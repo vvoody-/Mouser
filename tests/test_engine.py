@@ -505,6 +505,28 @@ class EngineReplayPhaseOneTests(unittest.TestCase):
 
         self.assertFalse(engine._last_hid_features_ready)
 
+    def test_reconnect_after_sleep_timeout_replays_saved_settings(self):
+        # Asleep path: disconnect is reported while the listener still holds
+        # its device info; the sleep-timeout cleanup clears it silently, and
+        # the eventual reconnect finds hid-ready unchanged from last seen.
+        engine = self._make_engine()
+        engine.hook._hid_gesture = self._make_hid(
+            connected_device=SimpleNamespace(name="MX Master 4")
+        )
+        threads = []
+
+        with patch("core.engine.threading.Thread", side_effect=self._thread_factory(threads)):
+            engine._on_connection_change(True)
+            self.assertEqual(len(self._non_battery_threads(threads)), 1)
+            self._non_battery_threads(threads)[0].run_target()
+
+            engine._on_connection_change(False)
+            engine.hook._hid_gesture.connected_device = None
+            engine.hook._hid_gesture.connected_device = SimpleNamespace(name="MX Master 4")
+            engine._on_connection_change(True)
+
+        self.assertEqual(len(self._non_battery_threads(threads)), 2)
+
     def test_startup_fallback_does_not_queue_replay_after_hid_ready_replay_requested(self):
         engine = self._make_engine()
         engine.hook._hid_gesture = self._make_hid(connected_device=None)

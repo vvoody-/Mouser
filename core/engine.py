@@ -1426,7 +1426,14 @@ class Engine:
                 name="BatteryPoll",
             )
             self._battery_poll_thread.start()
-        if hid_features_ready and hid_features_changed:
+        # A reconnect edge replays even when hid-ready did not flip: the
+        # listener's asleep path reports the disconnect while keeping its
+        # device info, and the later sleep-timeout cleanup clears it without
+        # another callback, so the engine never observes hid-ready go False.
+        # The device power-cycled in between and lost DPI / SmartShift.
+        if hid_features_ready and (
+            hid_features_changed or (connected and connection_changed)
+        ):
             self._request_saved_settings_replay()
 
     def _background_hid_poll_allowed(self, now):
